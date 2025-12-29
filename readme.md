@@ -1,6 +1,6 @@
 这是我用gemini 3 pro preview生成的时间戳转换小工具。[去下载exe](https://github.com/nmfmn/timestampConverterForWindows/releases/tag/release)
 
-<img src="D:\program\timestampConverter\demoGif.gif" style="zoom:50%;" />
+<img src="demoGif.gif" style="zoom:50%;" />
 
 
 # 🕒 TimeConverter - 极简时间戳转换工具
