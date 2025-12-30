@@ -1,4 +1,4 @@
-这是我用gemini 3 pro preview生成的时间戳转换小工具。[去下载exe](https://github.com/nmfmn/timestampConverterForWindows/releases/tag/release)
+这是我用gemini 3 pro preview生成的时间戳转换小工具。[去下载exe](https://github.com/nmfmn/timestampConverterForWindows/releases)
 
 <img src="demoGif.gif" style="zoom:50%;" />
 
