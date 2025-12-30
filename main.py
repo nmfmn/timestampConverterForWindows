@@ -13,14 +13,13 @@ from datetime import datetime
 from PIL import Image, ImageDraw
 import pystray
 
-# --- 强制让控制台可见输出 (方便调试) ---
+# --- 日志 / 控制台输出配置 ---
 try:
     sys.stdout.reconfigure(encoding='utf-8')
 except:
     pass
 
 def console_log(msg):
-    """打印日志"""
     timestamp = datetime.now().strftime("%H:%M:%S")
     print(f"[{timestamp}] {msg}")
 
@@ -31,6 +30,7 @@ try:
 except:
     pass
 
+# --- 配置管理类 ---
 class ConfigManager:
     def __init__(self):
         self.config_file = "config.json"
@@ -64,6 +64,7 @@ class ConfigManager:
         except:
             pass
 
+# --- 主程序类 ---
 class TimestampTool:
     def __init__(self):
         console_log("=== 程序正在启动 ===")
@@ -78,17 +79,19 @@ class TimestampTool:
         self.main_app = ctk.CTk()
         self.main_app.withdraw()
         
-        # 注册热键
+        # 1. 注册热键
         self.register_hotkey()
         
-        # 设置开机自启
+        # 2. 设置开机自启
         self.setup_autostart()
         
-        # 启动托盘
+        # 3. 启动托盘
         threading.Thread(target=self.create_tray_icon, daemon=True).start()
         
-        console_log("=== 初始化完成，等待快捷键触发 ===")
-        console_log(f"当前监听快捷键: {self.current_hotkey}")
+        # 4. 【新增】启动心跳保活线程
+        threading.Thread(target=self.start_heartbeat, daemon=True).start()
+        
+        console_log(f"=== 初始化完成，监听中: {self.current_hotkey} ===")
         
         self.main_app.mainloop()
 
@@ -104,24 +107,38 @@ class TimestampTool:
             reg_key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_SET_VALUE)
             winreg.SetValueEx(reg_key, key, 0, winreg.REG_SZ, exe_path)
             winreg.CloseKey(reg_key)
-        except Exception as e:
-            console_log(f"自启设置失败(非致命): {e}")
+        except Exception:
+            pass
 
     def register_hotkey(self):
-        """修复后的注册逻辑"""
+        """注册热键的核心逻辑"""
         try:
-            # 【关键修改】加了 try-except 保护
-            # keyboard 库在首次运行时调用 unhook 可能会报错，我们忽略这个错误
+            # 先尝试移除所有，防止重复堆叠
             try:
                 keyboard.unhook_all_hotkeys()
-            except Exception:
+            except:
                 pass
             
-            # 继续注册新热键
+            # 重新注册
             keyboard.add_hotkey(self.current_hotkey, self.process_hotkey)
-            console_log(f"✅ 热键注册成功: {self.current_hotkey}")
+            console_log(f"✅ 热键已(重新)挂载: {self.current_hotkey}")
         except Exception as e:
-            console_log(f"❌ 热键注册严重失败: {e}")
+            console_log(f"❌ 热键挂载失败: {e}")
+
+    # --- 【新增】心跳保活机制 ---
+    def start_heartbeat(self):
+        """
+        每隔 5 分钟醒来一次，强制重新注册一遍快捷键。
+        这能有效防止 Windows 因为长时间无响应而把钩子丢掉。
+        """
+        while True:
+            # 300秒 = 5分钟
+            time.sleep(300) 
+            console_log("❤️ 执行心跳保活：刷新快捷键钩子...")
+            
+            # 在子线程调用主逻辑通常不安全，但 keyboard 库是线程独立的，
+            # 只要不涉及 UI 操作，这里直接重新注册是安全的。
+            self.register_hotkey()
 
     def create_tray_icon(self):
         width = 64
@@ -146,14 +163,12 @@ class TimestampTool:
         self.main_app.after(0, self.show_settings_ui)
 
     def quit_app(self, icon=None, item=None):
-        console_log("程序退出")
         self.icon.stop()
         self.main_app.quit()
         os._exit(0)
 
     def extract_and_convert(self, text):
         if not text: return "剪切板为空", False
-        
         match = re.search(r'\b\d{10,13}\b', text)
         if match:
             raw_ts = match.group(0)
@@ -166,40 +181,38 @@ class TimestampTool:
             dt = datetime.fromtimestamp(ts)
             return dt.strftime("%Y-%m-%d %H:%M:%S"), True
         except:
-            return f"非时间戳: {text[:15]}...", False
+            return f"非时间戳: {text[:10]}...", False
 
     def process_hotkey(self):
-        console_log(">>> 快捷键被触发")
+        console_log(">>> 触发快捷键")
         try:
             # 1. 释放按键
             keys = self.current_hotkey.replace(' ', '').split('+')
             for k in keys: keyboard.release(k)
             time.sleep(0.05)
 
-            # 2. 复制
+            # 2. 复制 (增加容错)
             old_clip = pyperclip.paste()
             keyboard.send('ctrl+c')
             
-            # 等待剪切板变化（简单的重试机制）
+            # 循环等待剪切板更新，最多等待 0.4 秒
             for _ in range(4):
                 time.sleep(0.1)
                 if pyperclip.paste() != old_clip:
                     break
             
             content = pyperclip.paste()
-            console_log(f"剪切板获取: '{content}'")
             
-            # 3. 转换
+            # 3. 转换 & 弹窗
             result_text, is_success = self.extract_and_convert(content)
-            
-            # 4. 弹窗
             self.main_app.after(0, lambda: self.show_popup_ui(result_text, is_success))
 
         except Exception as e:
-            console_log(f"❌ 运行出错: {traceback.format_exc()}")
+            console_log(f"❌ 运行错误: {traceback.format_exc()}")
+            # 如果出错，尝试立即重置一次钩子，防止下次也挂掉
+            self.register_hotkey()
 
     def show_popup_ui(self, result_text, is_success):
-        console_log("正在显示弹窗")
         if self.root:
             try: self.root.destroy()
             except: pass
@@ -208,10 +221,7 @@ class TimestampTool:
         self.root.overrideredirect(True)
         self.root.attributes('-topmost', True)
         
-        # 尺寸
         w, h = 260, 75
-        
-        # 智能跟随鼠标
         try:
             mouse_x = self.root.winfo_pointerx()
             mouse_y = self.root.winfo_pointery()
@@ -228,24 +238,20 @@ class TimestampTool:
         
         self.root.geometry(f'{w}x{h}+{final_x}+{final_y}')
         
-        # 延时绑定自动关闭，防止秒关
         self.root.after(400, lambda: self.root.bind("<FocusOut>", lambda e: self.root.destroy()))
-        
         self.root.bind("<Escape>", lambda e: self.root.destroy())
         self.root.bind("<Return>", lambda e: self.copy_and_close(result_text))
 
         frame = ctk.CTkFrame(self.root, fg_color=("gray95", "gray15"), corner_radius=10)
         frame.pack(fill="both", expand=True, padx=1, pady=1)
         
-        color = ("#1a1a1a", "#ffffff") if is_success else "#D03030" # 成功黑白，失败红
-        
+        color = ("#1a1a1a", "#ffffff") if is_success else "#D03030"
         lbl = ctk.CTkLabel(frame, text=result_text, font=("Consolas", 15, "bold"), text_color=color)
         lbl.pack(pady=(15, 2))
 
         hint = "按 Enter 复制" if is_success else "未识别到时间戳"
         ctk.CTkLabel(frame, text=hint, font=("Microsoft YaHei UI", 10), text_color="gray").pack()
 
-        # 强制置顶并获取焦点
         self.root.after(50, self.root.focus_force)
         self.root.after(50, self.root.lift)
 
@@ -263,11 +269,10 @@ class TimestampTool:
         self.setting_window.title("设置")
         self.setting_window.geometry("300x180")
         
-        # 居中
         ws = self.setting_window.winfo_screenwidth()
         hs = self.setting_window.winfo_screenheight()
-        x = (ws/2) - (150)
-        y = (hs/2) - (90)
+        x = (ws/2) - 150
+        y = (hs/2) - 90
         self.setting_window.geometry(f'+{int(x)}+{int(y)}')
         
         self.setting_window.attributes('-topmost', True)
@@ -277,7 +282,6 @@ class TimestampTool:
         frame.pack(fill="both", expand=True, padx=20, pady=20)
 
         ctk.CTkLabel(frame, text="修改快捷键", font=("Microsoft YaHei UI", 12, "bold")).pack(pady=5)
-        
         entry = ctk.CTkEntry(frame, placeholder_text=self.current_hotkey)
         entry.insert(0, self.current_hotkey)
         entry.pack(pady=10, fill="x")
@@ -286,16 +290,11 @@ class TimestampTool:
             new_key = entry.get().strip().lower()
             if new_key:
                 try:
-                    # 尝试移除旧的(这里也加try避免崩溃)
-                    try: keyboard.remove_hotkey(self.process_hotkey)
-                    except: pass
-                    
                     self.current_hotkey = new_key
                     self.config.save_config("hotkey", new_key)
-                    self.register_hotkey()
+                    self.register_hotkey() # 这里的重新注册也会重置心跳的目标
                     self.setting_window.destroy()
-                except Exception as e:
-                    print(e)
+                except Exception:
                     entry.configure(border_color="red")
             
         ctk.CTkButton(frame, text="保存生效", command=save_hotkey).pack(pady=10)
