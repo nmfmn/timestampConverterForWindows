@@ -146,34 +146,45 @@ class TimestampTool:
 
     def process_logic(self):
         try:
-            # 1. 释放修饰键？pynput 不需要手动释放，因为它不是 Hook 拦截式的
-            # 但为了模拟 Ctrl+C，我们需要确保物理按键状态不干扰
-            # pynput 模拟按键非常快
+            # --- 1. 强制清空剪切板 ---
+            pyperclip.copy("") 
             
-            # 2. 模拟 Ctrl+C
-            # 保存旧剪切板
-            old_clip = pyperclip.paste()
+            # --- 2. 【关键修复】主动释放干扰按键 ---
+            # 因为快捷键是 Ctrl+Alt+H，如果不松开 Alt，
+            # 发送 Ctrl+C 会变成 Ctrl+Alt+C (导致复制失败)
+            self.kb_controller.release(Key.alt)
+            self.kb_controller.release(Key.alt_l)
+            self.kb_controller.release(Key.alt_r)
             
-            # 这里的模拟按键比 keyboard 库更底层一点
+            # 如果你的快捷键里包含 Shift，最好也释放一下
+            self.kb_controller.release(Key.shift)
+            
+            # 给系统 0.1 秒反应时间，确保 Alt 状态已清除
+            time.sleep(0.1)
+            
+            # --- 3. 模拟 Ctrl+C ---
             with self.kb_controller.pressed(Key.ctrl):
                 self.kb_controller.tap('c')
             
-            # 等待剪切板更新
-            for _ in range(5):
+            # --- 4. 智能等待 (Retry Loop) ---
+            content = ""
+            for _ in range(10): # 尝试 10 次
                 time.sleep(0.05)
-                if pyperclip.paste() != old_clip:
+                content = pyperclip.paste()
+                if content: 
                     break
             
-            content = pyperclip.paste()
-            
-            # 3. 转换 & 弹窗
+            # --- 5. 结果判断 ---
+            if not content:
+                console_log("剪切板为空 (可能是权限不足，请尝试以管理员运行)")
+                return 
+
+            # --- 6. 转换并显示 ---
             result_text, is_success = self.extract_and_convert(content)
-            
-            # 4. 切换到主线程显示 UI
             self.main_app.after(0, lambda: self.show_popup_ui(result_text, is_success))
             
         except Exception as e:
-            console_log(f"❌ 处理错误: {e}")
+            console_log(f"处理错误: {e}")
 
     def extract_and_convert(self, text):
         if not text: return "剪切板为空", False
