@@ -232,7 +232,8 @@ class TimestampTool:
 
     # --- UI: 时间戳小弹窗 ---
     def show_time_ui(self, result_text, is_success):
-        self._create_popup_window(260, 80)
+        # 时间戳窗口：保持“阅后即焚”，点击外部自动关闭
+        self._create_popup_window(260, 80, auto_close=True)
         
         frame = ctk.CTkFrame(self.root, fg_color=("gray95", "gray15"), corner_radius=10)
         frame.pack(fill="both", expand=True, padx=1, pady=1)
@@ -250,14 +251,13 @@ class TimestampTool:
 
     # --- UI: JSON 大弹窗 ---
     def show_json_ui(self, result_text, is_success):
-        # JSON 窗口需要大一点，且不需要那么严格的鼠标跟随，防止超出屏幕
-        # 这里设定一个最大尺寸，并尝试居中或在鼠标附近
-        self._create_popup_window(500, 400, is_large=True)
+        # JSON 窗口：关闭“自动关闭”，允许用户操作
+        self._create_popup_window(500, 400, auto_close=False)
         
         frame = ctk.CTkFrame(self.root, fg_color=("gray95", "gray15"), corner_radius=10)
         frame.pack(fill="both", expand=True, padx=1, pady=1)
 
-        # 标题栏区域
+        # 标题栏
         title_frame = ctk.CTkFrame(frame, fg_color="transparent", height=30)
         title_frame.pack(fill="x", padx=10, pady=(5,0))
         
@@ -267,7 +267,7 @@ class TimestampTool:
         
         ctk.CTkLabel(title_frame, text="按 Esc 关闭", font=("Microsoft YaHei UI", 10), text_color="gray").pack(side="right")
 
-        # 文本区域 (使用 Textbox 以支持滚动)
+        # 文本区域
         textbox = ctk.CTkTextbox(
             frame, 
             width=480, 
@@ -276,21 +276,31 @@ class TimestampTool:
             activate_scrollbars=True
         )
         textbox.pack(fill="both", expand=True, padx=10, pady=5)
+        
+        # 插入文本
         textbox.insert("0.0", result_text)
-        # 设置只读，防止误触修改，但允许复制
-        textbox.configure(state="disabled") 
+        
+        # --- 关键修改：关于文本框状态 ---
+        # 如果设为 "disabled"，用户将无法选中文本进行部分复制。
+        # 如果设为 "normal"，用户可以编辑。
+        # 为了让用户能选中复制，我们必须设为 "normal"。
+        # 虽然用户可以修改里面的字，但这只是个查看器，修改了也不影响原数据，所以是可以接受的。
+        textbox.configure(state="normal") 
 
         # 底部按钮
         btn_frame = ctk.CTkFrame(frame, fg_color="transparent")
         btn_frame.pack(fill="x", padx=10, pady=(0, 10))
         
         if is_success:
+            # 复制全部并关闭
             ctk.CTkButton(
                 btn_frame, 
-                text="复制结果 (Enter)", 
+                text="复制全部并关闭 (Enter)", 
                 height=28,
                 command=lambda: self.copy_and_close(result_text)
             ).pack(fill="x")
+            
+            # 绑定回车键复制全部
             self.root.bind("<Return>", lambda e: self.copy_and_close(result_text))
         else:
             ctk.CTkButton(
@@ -301,15 +311,20 @@ class TimestampTool:
                 command=lambda: self.root.destroy()
             ).pack(fill="x")
 
-    def _create_popup_window(self, w, h, is_large=False):
-        """通用的窗口创建逻辑"""
+    def _create_popup_window(self, w, h, auto_close=True):
+        """
+        通用的窗口创建逻辑
+        :param w: 宽度
+        :param h: 高度
+        :param auto_close: 是否开启失去焦点自动关闭 (时间戳True, JSON False)
+        """
         if self.root:
             try: self.root.destroy()
             except: pass
 
         self.root = ctk.CTkToplevel(self.main_app)
-        self.root.overrideredirect(True)
-        self.root.attributes('-topmost', True)
+        self.root.overrideredirect(True) # 无边框
+        self.root.attributes('-topmost', True) # 置顶
         
         try:
             mouse_x = self.root.winfo_pointerx()
@@ -326,13 +341,20 @@ class TimestampTool:
         # 边界检测
         if final_x + w > screen_w: final_x = mouse_x - w - 10
         if final_y + h > screen_h: final_y = mouse_y - h - 10
-        # 防止顶部超出
         if final_y < 0: final_y = 10
         
         self.root.geometry(f'{w}x{h}+{final_x}+{final_y}')
         
-        # 延时绑定自动关闭
-        self.root.after(400, lambda: self.root.bind("<FocusOut>", lambda e: self.root.destroy()))
+        # --- 关键修改：区分由于关闭逻辑 ---
+        if auto_close:
+            # 只有时间戳窗口才启用“失去焦点自动关闭”
+            # 延时绑定是为了防止窗口刚弹出还没获取焦点就触发关闭
+            self.root.after(400, lambda: self.root.bind("<FocusOut>", lambda e: self.root.destroy()))
+        else:
+            # JSON 窗口不绑定 FocusOut，这样你就可以在里面随便点击、选字了
+            pass
+
+        # 无论哪种窗口，ESC 键都能关闭
         self.root.bind("<Escape>", lambda e: self.root.destroy())
         
         self.root.after(50, self.root.focus_force)
