@@ -10,7 +10,7 @@ import re
 from datetime import datetime
 from PIL import Image, ImageDraw
 import pystray
-import pytz  # --- 新增依赖 ---
+import pytz
 
 # --- 引入 pynput ---
 from pynput import keyboard as pynput_kb
@@ -36,10 +36,11 @@ except:
 class ConfigManager:
     def __init__(self):
         self.config_file = "config.json"
-        # 默认增加 timezone 字段，默认值为 "Local"
+        # 默认配置增加 json_hotkey
         self.default_config = {
-            "hotkey": "<ctrl>+<alt>+h", 
-            "timezone": "Local" 
+            "time_hotkey": "<ctrl>+<alt>+h",
+            "json_hotkey": "<ctrl>+<alt>+j",
+            "timezone": "Local"
         }
         self.data = self.load_config()
 
@@ -57,10 +58,14 @@ class ConfigManager:
             try:
                 with open(path, 'r', encoding='utf-8') as f:
                     data = json.load(f)
-                    # 补全可能缺失的字段
+                    # 兼容旧配置文件，补全缺失字段
                     for k, v in self.default_config.items():
                         if k not in data:
-                            data[k] = v
+                            # 旧版本叫 'hotkey'，迁移到 'time_hotkey'
+                            if k == 'time_hotkey' and 'hotkey' in data:
+                                data['time_hotkey'] = data['hotkey']
+                            else:
+                                data[k] = v
                     return data
             except:
                 return self.default_config
@@ -76,14 +81,17 @@ class ConfigManager:
 
 class TimestampTool:
     def __init__(self):
-        console_log("=== 时间戳工具 (时区增强版) 启动 ===")
+        console_log("=== DevTools Pro 启动 ===")
         self.config = ConfigManager()
-        self.current_hotkey_str = self.config.data.get("hotkey", "<ctrl>+<alt>+h")
+        
+        # 读取配置
+        self.time_hotkey = self.config.data.get("time_hotkey", "<ctrl>+<alt>+h")
+        self.json_hotkey = self.config.data.get("json_hotkey", "<ctrl>+<alt>+j")
         self.current_timezone = self.config.data.get("timezone", "Local")
         
         self.root = None
         self.setting_window = None
-        self.timezone_window = None # 时区设置窗口
+        self.timezone_window = None
         
         self.kb_controller = Controller()
         self.listener = None
@@ -99,7 +107,7 @@ class TimestampTool:
         
         threading.Thread(target=self.create_tray_icon, daemon=True).start()
         
-        console_log(f"监听: {self.current_hotkey_str} | 时区: {self.current_timezone}")
+        console_log(f"监听时间: {self.time_hotkey} | 监听JSON: {self.json_hotkey}")
         
         self.main_app.mainloop()
 
@@ -124,23 +132,30 @@ class TimestampTool:
             except: pass
 
         try:
-            hotkey_map = { self.current_hotkey_str: self.on_hotkey_triggered }
+            # 注册两个快捷键，分别绑定不同的 action 标识
+            hotkey_map = {
+                self.time_hotkey: lambda: self.dispatch_action("time"),
+                self.json_hotkey: lambda: self.dispatch_action("json")
+            }
             self.listener = pynput_kb.GlobalHotKeys(hotkey_map)
             self.listener.start()
-            console_log(f"✅ 监听器已启动")
+            console_log(f"✅ 监听器已更新")
         except Exception as e:
             console_log(f"❌ 监听启动失败: {e}")
 
-    def on_hotkey_triggered(self):
-        console_log(">>> 快捷键触发")
-        self.process_logic()
+    def dispatch_action(self, action_type):
+        """快捷键触发的分发中心"""
+        console_log(f">>> 触发动作: {action_type}")
+        # 在 pynput 线程中调用，需要通过 after 调度到主线程或直接处理逻辑
+        # 这里为了不阻塞监听线程，直接执行复制逻辑（复制逻辑耗时短），UI 放到主线程
+        self.perform_copy_and_process(action_type)
 
-    def process_logic(self):
+    def perform_copy_and_process(self, action_type):
         try:
             # 1. 强制清空
             pyperclip.copy("") 
             
-            # 2. 释放可能干扰的修饰键 (Alt, Shift)
+            # 2. 释放干扰键
             self.kb_controller.release(Key.alt)
             self.kb_controller.release(Key.alt_l)
             self.kb_controller.release(Key.alt_r)
@@ -162,16 +177,19 @@ class TimestampTool:
                 console_log("剪切板为空")
                 return 
 
-            # 5. 转换并显示
-            result_text, is_success = self.extract_and_convert(content)
-            self.main_app.after(0, lambda: self.show_popup_ui(result_text, is_success))
+            # 5. 根据类型分发处理
+            if action_type == "time":
+                result, success = self.process_timestamp(content)
+                self.main_app.after(0, lambda: self.show_time_ui(result, success))
+            elif action_type == "json":
+                result, success = self.process_json(content)
+                self.main_app.after(0, lambda: self.show_json_ui(result, success))
             
         except Exception as e:
             console_log(f"❌ 处理错误: {e}")
 
-    def extract_and_convert(self, text):
-        if not text: return "内容为空", False
-        
+    # --- 逻辑：时间戳处理 ---
+    def process_timestamp(self, text):
         match = re.search(r'(\d{10,13}(?:\.\d+)?)', text)
         if match:
             raw_ts = match.group(1)
@@ -185,26 +203,106 @@ class TimestampTool:
             if ts < 0 or ts > 32503680000:
                  return f"数值越界: {raw_ts[:10]}...", False
 
-            # --- 时区处理逻辑 ---
             if self.current_timezone == "Local":
-                # 跟随系统本地时间
                 dt = datetime.fromtimestamp(ts)
             else:
-                # 指定时区
                 try:
                     target_tz = pytz.timezone(self.current_timezone)
                     dt = datetime.fromtimestamp(ts, target_tz)
                 except:
-                    # 如果时区名有误，回退到本地
                     dt = datetime.fromtimestamp(ts)
-            # --------------------
 
             return dt.strftime("%Y-%m-%d %H:%M:%S"), True
         except:
             return f"非时间戳: {text[:15]}...", False
 
-    # --- UI: 结果弹窗 ---
-    def show_popup_ui(self, result_text, is_success):
+    # --- 逻辑：JSON 处理 ---
+    def process_json(self, text):
+        try:
+            text = text.strip()
+            # 尝试解析 JSON
+            parsed = json.loads(text)
+            # 格式化输出 (indent=4 缩进, ensure_ascii=False 支持中文)
+            formatted = json.dumps(parsed, indent=4, ensure_ascii=False)
+            return formatted, True
+        except json.JSONDecodeError as e:
+            return f"JSON 解析失败:\n{e}\n\n原始内容:\n{text[:100]}...", False
+        except Exception as e:
+            return f"未知错误:\n{e}", False
+
+    # --- UI: 时间戳小弹窗 ---
+    def show_time_ui(self, result_text, is_success):
+        self._create_popup_window(260, 80)
+        
+        frame = ctk.CTkFrame(self.root, fg_color=("gray95", "gray15"), corner_radius=10)
+        frame.pack(fill="both", expand=True, padx=1, pady=1)
+        
+        color = ("#1a1a1a", "#ffffff") if is_success else "#D03030"
+        
+        lbl = ctk.CTkLabel(frame, text=result_text, font=("Consolas", 15, "bold"), text_color=color)
+        lbl.pack(pady=(12, 0))
+
+        tz_display = "Local" if self.current_timezone == "Local" else self.current_timezone
+        ctk.CTkLabel(frame, text=f"({tz_display}) 按 Enter 复制", font=("Microsoft YaHei UI", 10), text_color="gray").pack()
+        
+        # 绑定事件
+        self.root.bind("<Return>", lambda e: self.copy_and_close(result_text))
+
+    # --- UI: JSON 大弹窗 ---
+    def show_json_ui(self, result_text, is_success):
+        # JSON 窗口需要大一点，且不需要那么严格的鼠标跟随，防止超出屏幕
+        # 这里设定一个最大尺寸，并尝试居中或在鼠标附近
+        self._create_popup_window(500, 400, is_large=True)
+        
+        frame = ctk.CTkFrame(self.root, fg_color=("gray95", "gray15"), corner_radius=10)
+        frame.pack(fill="both", expand=True, padx=1, pady=1)
+
+        # 标题栏区域
+        title_frame = ctk.CTkFrame(frame, fg_color="transparent", height=30)
+        title_frame.pack(fill="x", padx=10, pady=(5,0))
+        
+        title_text = "JSON 格式化成功" if is_success else "格式化失败"
+        title_color = "#107C10" if is_success else "#D03030"
+        ctk.CTkLabel(title_frame, text=title_text, font=("Microsoft YaHei UI", 12, "bold"), text_color=title_color).pack(side="left")
+        
+        ctk.CTkLabel(title_frame, text="按 Esc 关闭", font=("Microsoft YaHei UI", 10), text_color="gray").pack(side="right")
+
+        # 文本区域 (使用 Textbox 以支持滚动)
+        textbox = ctk.CTkTextbox(
+            frame, 
+            width=480, 
+            height=300, 
+            font=("Consolas", 11),
+            activate_scrollbars=True
+        )
+        textbox.pack(fill="both", expand=True, padx=10, pady=5)
+        textbox.insert("0.0", result_text)
+        # 设置只读，防止误触修改，但允许复制
+        textbox.configure(state="disabled") 
+
+        # 底部按钮
+        btn_frame = ctk.CTkFrame(frame, fg_color="transparent")
+        btn_frame.pack(fill="x", padx=10, pady=(0, 10))
+        
+        if is_success:
+            ctk.CTkButton(
+                btn_frame, 
+                text="复制结果 (Enter)", 
+                height=28,
+                command=lambda: self.copy_and_close(result_text)
+            ).pack(fill="x")
+            self.root.bind("<Return>", lambda e: self.copy_and_close(result_text))
+        else:
+            ctk.CTkButton(
+                btn_frame, 
+                text="关闭", 
+                height=28, 
+                fg_color="#D03030", hover_color="#B02020",
+                command=lambda: self.root.destroy()
+            ).pack(fill="x")
+
+    def _create_popup_window(self, w, h, is_large=False):
+        """通用的窗口创建逻辑"""
         if self.root:
             try: self.root.destroy()
             except: pass
@@ -213,40 +311,30 @@ class TimestampTool:
         self.root.overrideredirect(True)
         self.root.attributes('-topmost', True)
         
-        w, h = 260, 80
         try:
             mouse_x = self.root.winfo_pointerx()
             mouse_y = self.root.winfo_pointery()
         except:
             mouse_x, mouse_y = 500, 500
             
+        screen_w = self.root.winfo_screenwidth()
+        screen_h = self.root.winfo_screenheight()
+        
         final_x = mouse_x + 15
         final_y = mouse_y + 15
         
-        screen_w = self.root.winfo_screenwidth()
-        screen_h = self.root.winfo_screenheight()
+        # 边界检测
         if final_x + w > screen_w: final_x = mouse_x - w - 10
         if final_y + h > screen_h: final_y = mouse_y - h - 10
-
+        # 防止顶部超出
+        if final_y < 0: final_y = 10
+        
         self.root.geometry(f'{w}x{h}+{final_x}+{final_y}')
         
+        # 延时绑定自动关闭
         self.root.after(400, lambda: self.root.bind("<FocusOut>", lambda e: self.root.destroy()))
         self.root.bind("<Escape>", lambda e: self.root.destroy())
-        self.root.bind("<Return>", lambda e: self.copy_and_close(result_text))
-
-        frame = ctk.CTkFrame(self.root, fg_color=("gray95", "gray15"), corner_radius=10)
-        frame.pack(fill="both", expand=True, padx=1, pady=1)
         
-        color = ("#1a1a1a", "#ffffff") if is_success else "#D03030"
-        
-        # 显示结果
-        lbl = ctk.CTkLabel(frame, text=result_text, font=("Consolas", 15, "bold"), text_color=color)
-        lbl.pack(pady=(12, 0))
-
-        # 显示当前时区的小字
-        tz_display = "本地时间" if self.current_timezone == "Local" else self.current_timezone
-        ctk.CTkLabel(frame, text=f"({tz_display}) 按 Enter 复制", font=("Microsoft YaHei UI", 10), text_color="gray").pack()
-
         self.root.after(50, self.root.focus_force)
         self.root.after(50, self.root.lift)
 
@@ -263,14 +351,15 @@ class TimestampTool:
         image = Image.new('RGB', (width, height), "#0078D4")
         d = ImageDraw.Draw(image)
         d.rectangle((16, 16, 48, 48), fill="white")
+        d.text((22, 20), "T", fill="#0078D4") # 简单画个T
         
         menu = pystray.Menu(
-            pystray.MenuItem("修改时区 (Timezone)", self.open_timezone_safe), # 新增菜单
-            pystray.MenuItem("设置快捷键 (Hotkey)", self.open_settings_safe),
+            pystray.MenuItem("修改时区 (Timezone)", self.open_timezone_safe),
+            pystray.MenuItem("设置快捷键 (Settings)", self.open_settings_safe),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("退出 (Exit)", self.quit_app)
         )
-        self.icon = pystray.Icon("TimestampTool", image, "时间戳助手", menu)
+        self.icon = pystray.Icon("DevTool", image, "开发助手", menu)
         self.icon.run()
 
     def open_settings_safe(self, icon=None, item=None):
@@ -285,68 +374,77 @@ class TimestampTool:
         self.main_app.quit()
         os._exit(0)
 
-    # --- 界面：设置快捷键 ---
+    # --- 设置界面 (升级版：支持两个快捷键) ---
     def show_settings_ui(self):
         if self.setting_window and self.setting_window.winfo_exists():
             self.setting_window.focus(); return
 
         self.setting_window = ctk.CTkToplevel(self.main_app)
         self.setting_window.title("设置快捷键")
-        self.setting_window.geometry("300x180")
+        self.setting_window.geometry("340x260")
         
         ws = self.setting_window.winfo_screenwidth()
         hs = self.setting_window.winfo_screenheight()
-        self.setting_window.geometry(f'+{int(ws/2-150)}+{int(hs/2-90)}')
+        self.setting_window.geometry(f'+{int(ws/2-170)}+{int(hs/2-130)}')
         self.setting_window.attributes('-topmost', True)
 
         frame = ctk.CTkFrame(self.setting_window)
         frame.pack(fill="both", expand=True, padx=20, pady=20)
 
-        ctk.CTkLabel(frame, text="修改快捷键", font=("Microsoft YaHei UI", 12, "bold")).pack(pady=5)
-        entry = ctk.CTkEntry(frame, placeholder_text=self.current_hotkey_str)
-        entry.insert(0, self.current_hotkey_str)
-        entry.pack(pady=10, fill="x")
+        ctk.CTkLabel(frame, text="快捷键配置 (pynput格式)", font=("Microsoft YaHei UI", 12, "bold")).pack(pady=5)
+        
+        # 时间戳设置
+        ctk.CTkLabel(frame, text="时间戳转换:", anchor="w").pack(fill="x", pady=(5,0))
+        entry_time = ctk.CTkEntry(frame)
+        entry_time.insert(0, self.time_hotkey)
+        entry_time.pack(fill="x", pady=2)
 
-        def save_hotkey():
-            new_key = entry.get().strip().lower()
-            if new_key:
+        # JSON设置
+        ctk.CTkLabel(frame, text="JSON 格式化:", anchor="w").pack(fill="x", pady=(5,0))
+        entry_json = ctk.CTkEntry(frame)
+        entry_json.insert(0, self.json_hotkey)
+        entry_json.pack(fill="x", pady=2)
+
+        def save_config():
+            t_key = entry_time.get().strip().lower()
+            j_key = entry_json.get().strip().lower()
+            
+            if t_key and j_key:
                 try:
-                    self.current_hotkey_str = new_key
-                    self.config.save_config("hotkey", new_key)
+                    self.time_hotkey = t_key
+                    self.json_hotkey = j_key
+                    
+                    self.config.save_config("time_hotkey", t_key)
+                    self.config.save_config("json_hotkey", j_key)
+                    
                     self.start_listener()
                     self.setting_window.destroy()
                 except:
-                    entry.configure(border_color="red")
+                    console_log("设置保存失败")
             
-        ctk.CTkButton(frame, text="保存", command=save_hotkey).pack(pady=10)
+        ctk.CTkButton(frame, text="保存生效", command=save_config).pack(pady=20)
 
-    # --- 界面：设置时区 ---
+    # --- 时区设置界面 (保持不变) ---
     def show_timezone_ui(self):
         if self.timezone_window and self.timezone_window.winfo_exists():
             self.timezone_window.focus(); return
 
         self.timezone_window = ctk.CTkToplevel(self.main_app)
         self.timezone_window.title("选择时区")
-        self.timezone_window.geometry("300x240")
+        self.timezone_window.geometry("300x200")
         
         ws = self.timezone_window.winfo_screenwidth()
         hs = self.timezone_window.winfo_screenheight()
-        self.timezone_window.geometry(f'+{int(ws/2-150)}+{int(hs/2-120)}')
+        self.timezone_window.geometry(f'+{int(ws/2-150)}+{int(hs/2-100)}')
         self.timezone_window.attributes('-topmost', True)
 
         frame = ctk.CTkFrame(self.timezone_window)
         frame.pack(fill="both", expand=True, padx=20, pady=20)
 
-        ctk.CTkLabel(frame, text="选择转换目标时区", font=("Microsoft YaHei UI", 12, "bold")).pack(pady=(5, 10))
+        ctk.CTkLabel(frame, text="目标时区", font=("Microsoft YaHei UI", 12, "bold")).pack(pady=10)
 
-        # 准备时区列表：常用时区置顶
-        common_tz = ["Local", "UTC", "Asia/Shanghai", "Asia/Tokyo", "America/New_York", "America/Los_Angeles", "Europe/London"]
-        all_tz = pytz.common_timezones
-        # 合并列表并去重
-        tz_list = common_tz + [tz for tz in all_tz if tz not in common_tz]
-
-        # 创建下拉框
-        combo = ctk.CTkComboBox(frame, values=tz_list, width=220, height=35)
+        common_tz = ["Local", "UTC", "Asia/Shanghai", "Asia/Tokyo", "America/New_York", "America/Los_Angeles"]
+        combo = ctk.CTkComboBox(frame, values=common_tz)
         combo.set(self.current_timezone)
         combo.pack(pady=10)
 
@@ -355,9 +453,8 @@ class TimestampTool:
             self.current_timezone = selected
             self.config.save_config("timezone", selected)
             self.timezone_window.destroy()
-            console_log(f"时区已更新为: {selected}")
             
-        ctk.CTkButton(frame, text="保存设置", command=save_timezone).pack(pady=20)
+        ctk.CTkButton(frame, text="保存", command=save_timezone).pack(pady=20)
 
 if __name__ == "__main__":
     TimestampTool()
