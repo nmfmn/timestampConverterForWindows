@@ -7,8 +7,8 @@ import sys
 import winreg
 import json
 import re
-import webbrowser # --- 新增: 浏览器控制 ---
-from urllib.parse import urlencode, urlparse, parse_qs, urlunparse # --- 新增: URL处理 ---
+import webbrowser
+from urllib.parse import urlencode, urlparse, parse_qs, urlunparse
 from datetime import datetime
 from PIL import Image, ImageDraw
 import pystray
@@ -38,16 +38,14 @@ except:
 class ConfigManager:
     def __init__(self):
         self.config_file = "config.json"
-        # 默认配置增加 trace 相关配置
         self.default_config = {
             "time_hotkey": "<ctrl>+<alt>+h",
             "json_hotkey": "<ctrl>+<alt>+j",
-            "trace_hotkey": "<ctrl>+<alt>+k", # 新快捷键
+            "trace_hotkey": "<ctrl>+<alt>+k",
             "timezone": "Local",
-            # Trace 默认配置 (示例)
             "trace_url": "https://www.google.com/search", 
-            "trace_key": "q",           # traceId 对应的参数名
-            "time_key": "startTime"     # 开始时间 对应的参数名
+            "trace_key": "q",           
+            "time_key": "startTime"     
         }
         self.data = self.load_config()
 
@@ -65,7 +63,6 @@ class ConfigManager:
             try:
                 with open(path, 'r', encoding='utf-8') as f:
                     data = json.load(f)
-                    # 补全可能缺失的字段
                     for k, v in self.default_config.items():
                         if k not in data:
                             data[k] = v
@@ -84,7 +81,7 @@ class ConfigManager:
 
 class TimestampTool:
     def __init__(self):
-        console_log("=== DevTools Pro v4.0 启动 ===")
+        console_log("=== DevTools Pro v4.1 启动 ===")
         self.config = ConfigManager()
         
         # 读取配置
@@ -142,11 +139,10 @@ class TimestampTool:
             except: pass
 
         try:
-            # 注册三个快捷键
             hotkey_map = {
                 self.time_hotkey: lambda: self.dispatch_action("time"),
                 self.json_hotkey: lambda: self.dispatch_action("json"),
-                self.trace_hotkey: lambda: self.dispatch_action("trace") # 新增
+                self.trace_hotkey: lambda: self.dispatch_action("trace")
             }
             self.listener = pynput_kb.GlobalHotKeys(hotkey_map)
             self.listener.start()
@@ -160,22 +156,18 @@ class TimestampTool:
 
     def perform_copy_and_process(self, action_type):
         try:
-            # 1. 强制清空
             pyperclip.copy("") 
             
-            # 2. 释放干扰键
             self.kb_controller.release(Key.alt)
             self.kb_controller.release(Key.alt_l)
             self.kb_controller.release(Key.alt_r)
             self.kb_controller.release(Key.shift)
-            self.kb_controller.release(Key.ctrl) # 有些组合键可能需要释放Ctrl
+            self.kb_controller.release(Key.ctrl)
             time.sleep(0.1)
             
-            # 3. 模拟 Ctrl+C
             with self.kb_controller.pressed(Key.ctrl):
                 self.kb_controller.tap('c')
             
-            # 4. 智能等待
             content = ""
             for _ in range(10):
                 time.sleep(0.05)
@@ -186,7 +178,6 @@ class TimestampTool:
                 console_log("剪切板为空")
                 return 
 
-            # 5. 分发处理
             if action_type == "time":
                 result, success = self.process_timestamp(content)
                 self.main_app.after(0, lambda: self.show_time_ui(result, success))
@@ -194,56 +185,40 @@ class TimestampTool:
                 result, success = self.process_json(content)
                 self.main_app.after(0, lambda: self.show_json_ui(result, success))
             elif action_type == "trace":
-                # Trace 逻辑直接在后台打开浏览器，不需要弹窗显示结果，
-                # 但如果打开失败或者配置没填，可以弹窗提示
                 self.process_trace(content)
             
         except Exception as e:
             console_log(f"❌ 处理错误: {e}")
 
-    # --- 逻辑：Trace 跳转 (新增) ---
+    # --- 逻辑：Trace 跳转 (已修复引号问题) ---
     def process_trace(self, text):
-        # 原始文本清理
         text = text.strip()
-        
         if not self.trace_url:
             self.main_app.after(0, lambda: self.show_time_ui("未配置 Trace URL", False))
             return
 
         try:
-            # 1. 准备基础 URL
             url_parts = list(urlparse(self.trace_url))
             query = parse_qs(url_parts[4])
 
-            # --- 【关键修改】深度清洗 TraceId ---
-            # 第一步：去除字符串内部的所有空白字符（防止跨行选中）
+            # --- 清洗 TraceId ---
+            # 1. 去除内部空白
             clean_trace_id = re.sub(r'\s+', '', text)
-            
-            # 第二步：去除首尾的 英文引号、单引号、逗号、冒号、分号
-            # 这样哪怕你双击选中了 "traceId", 也能清理干净
+            # 2. 去除首尾的 引号、逗号、冒号、分号
             clean_trace_id = clean_trace_id.strip('"\' ,:;')
-            # ----------------------------------
-
-            # 2. 添加 TraceId 参数
+            
             query[self.trace_key] = clean_trace_id
 
-            # 3. 添加时间参数 (当前时间 - 15分钟)
             if self.time_key:
                 now_ts = time.time()
                 start_ts_sec = now_ts - (15 * 60) # 15分钟前
-                
-                # 默认生成毫秒级时间戳 (如需秒级，去掉 * 1000 即可)
                 start_ts_ms = int(start_ts_sec * 1000)
-                
                 query[self.time_key] = start_ts_ms
 
-            # 4. 重新构建 URL
             url_parts[4] = urlencode(query, doseq=True)
             final_url = urlunparse(url_parts)
             
             console_log(f"打开网页: {final_url}")
-            
-            # 5. 调用系统默认浏览器打开
             webbrowser.open(final_url)
             
         except Exception as e:
@@ -378,7 +353,7 @@ class TimestampTool:
         
         menu = pystray.Menu(
             pystray.MenuItem("修改时区 (Timezone)", self.open_timezone_safe),
-            pystray.MenuItem("配置 Trace 链接 (New)", self.open_trace_config_safe), # 新增
+            pystray.MenuItem("配置 Trace 链接 (New)", self.open_trace_config_safe),
             pystray.MenuItem("设置快捷键", self.open_settings_safe),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("退出", self.quit_app)
@@ -399,7 +374,7 @@ class TimestampTool:
         self.main_app.quit()
         os._exit(0)
 
-    # --- 界面：设置快捷键 ---
+    # --- 设置界面 (3个快捷键) ---
     def show_settings_ui(self):
         if self.setting_window and self.setting_window.winfo_exists():
             self.setting_window.focus(); return
@@ -418,19 +393,16 @@ class TimestampTool:
 
         ctk.CTkLabel(frame, text="快捷键配置 (pynput格式)", font=("Microsoft YaHei UI", 12, "bold")).pack(pady=5)
         
-        # 时间戳
         ctk.CTkLabel(frame, text="时间戳转换:", anchor="w").pack(fill="x", pady=(5,0))
         entry_time = ctk.CTkEntry(frame)
         entry_time.insert(0, self.time_hotkey)
         entry_time.pack(fill="x", pady=2)
 
-        # JSON
         ctk.CTkLabel(frame, text="JSON 格式化:", anchor="w").pack(fill="x", pady=(5,0))
         entry_json = ctk.CTkEntry(frame)
         entry_json.insert(0, self.json_hotkey)
         entry_json.pack(fill="x", pady=2)
 
-        # Trace
         ctk.CTkLabel(frame, text="Trace 跳转:", anchor="w").pack(fill="x", pady=(5,0))
         entry_trace = ctk.CTkEntry(frame)
         entry_trace.insert(0, self.trace_hotkey)
@@ -446,18 +418,16 @@ class TimestampTool:
                     self.time_hotkey = t_key
                     self.json_hotkey = j_key
                     self.trace_hotkey = k_key
-                    
                     self.config.save_config("time_hotkey", t_key)
                     self.config.save_config("json_hotkey", j_key)
                     self.config.save_config("trace_hotkey", k_key)
-                    
                     self.start_listener()
                     self.setting_window.destroy()
                 except: pass
             
         ctk.CTkButton(frame, text="保存生效", command=save_config).pack(pady=20)
 
-    # --- 界面：Trace 链接配置 (新增) ---
+    # --- Trace 配置界面 ---
     def show_trace_config_ui(self):
         if self.trace_config_window and self.trace_config_window.winfo_exists():
             self.trace_config_window.focus(); return
@@ -476,19 +446,16 @@ class TimestampTool:
 
         ctk.CTkLabel(frame, text="Trace 网页跳转配置", font=("Microsoft YaHei UI", 12, "bold")).pack(pady=5)
         
-        # URL
         ctk.CTkLabel(frame, text="基础 URL (不带参数):", anchor="w").pack(fill="x")
         entry_url = ctk.CTkEntry(frame, placeholder_text="https://...")
         entry_url.insert(0, self.trace_url)
         entry_url.pack(fill="x", pady=(0, 10))
 
-        # Trace Key
         ctk.CTkLabel(frame, text="TraceId 参数名:", anchor="w").pack(fill="x")
         entry_trace_key = ctk.CTkEntry(frame, placeholder_text="例如: traceId 或 q")
         entry_trace_key.insert(0, self.trace_key)
         entry_trace_key.pack(fill="x", pady=(0, 10))
 
-        # Time Key
         ctk.CTkLabel(frame, text="开始时间 参数名 (默认填入-15min):", anchor="w").pack(fill="x")
         entry_time_key = ctk.CTkEntry(frame, placeholder_text="例如: startTime (留空则不传)")
         entry_time_key.insert(0, self.time_key)
@@ -509,10 +476,8 @@ class TimestampTool:
             
         ctk.CTkButton(frame, text="保存配置", command=save_trace_config).pack(pady=20)
 
-    # --- 界面：时区 (不变) ---
+    # --- 时区配置界面 ---
     def show_timezone_ui(self):
-        # ... (和之前版本一致，省略未改动代码以节省篇幅，请保留原有时区代码) ...
-        # 如果你直接复制，这里需要补全 show_timezone_ui 的代码
         if self.timezone_window and self.timezone_window.winfo_exists():
             self.timezone_window.focus(); return
 
