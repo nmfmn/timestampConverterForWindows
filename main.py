@@ -203,7 +203,9 @@ class TimestampTool:
 
     # --- 逻辑：Trace 跳转 (新增) ---
     def process_trace(self, text):
+        # 原始文本清理
         text = text.strip()
+        
         if not self.trace_url:
             self.main_app.after(0, lambda: self.show_time_ui("未配置 Trace URL", False))
             return
@@ -213,9 +215,16 @@ class TimestampTool:
             url_parts = list(urlparse(self.trace_url))
             query = parse_qs(url_parts[4])
 
-            # 2. 添加 TraceId 参数
-            # 清理一下 text，防止带入空格或换行
+            # --- 【关键修改】深度清洗 TraceId ---
+            # 第一步：去除字符串内部的所有空白字符（防止跨行选中）
             clean_trace_id = re.sub(r'\s+', '', text)
+            
+            # 第二步：去除首尾的 英文引号、单引号、逗号、冒号、分号
+            # 这样哪怕你双击选中了 "traceId", 也能清理干净
+            clean_trace_id = clean_trace_id.strip('"\' ,:;')
+            # ----------------------------------
+
+            # 2. 添加 TraceId 参数
             query[self.trace_key] = clean_trace_id
 
             # 3. 添加时间参数 (当前时间 - 15分钟)
@@ -223,8 +232,7 @@ class TimestampTool:
                 now_ts = time.time()
                 start_ts_sec = now_ts - (15 * 60) # 15分钟前
                 
-                # 默认使用毫秒级时间戳 (大多数监控系统标准)
-                # 如果你的系统用秒，可以去掉 * 1000
+                # 默认生成毫秒级时间戳 (如需秒级，去掉 * 1000 即可)
                 start_ts_ms = int(start_ts_sec * 1000)
                 
                 query[self.time_key] = start_ts_ms
