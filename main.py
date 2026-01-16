@@ -7,6 +7,8 @@ import sys
 import winreg
 import json
 import re
+import webbrowser # --- 新增: 浏览器控制 ---
+from urllib.parse import urlencode, urlparse, parse_qs, urlunparse # --- 新增: URL处理 ---
 from datetime import datetime
 from PIL import Image, ImageDraw
 import pystray
@@ -36,11 +38,16 @@ except:
 class ConfigManager:
     def __init__(self):
         self.config_file = "config.json"
-        # 默认配置增加 json_hotkey
+        # 默认配置增加 trace 相关配置
         self.default_config = {
             "time_hotkey": "<ctrl>+<alt>+h",
             "json_hotkey": "<ctrl>+<alt>+j",
-            "timezone": "Local"
+            "trace_hotkey": "<ctrl>+<alt>+k", # 新快捷键
+            "timezone": "Local",
+            # Trace 默认配置 (示例)
+            "trace_url": "https://www.google.com/search", 
+            "trace_key": "q",           # traceId 对应的参数名
+            "time_key": "startTime"     # 开始时间 对应的参数名
         }
         self.data = self.load_config()
 
@@ -58,14 +65,10 @@ class ConfigManager:
             try:
                 with open(path, 'r', encoding='utf-8') as f:
                     data = json.load(f)
-                    # 兼容旧配置文件，补全缺失字段
+                    # 补全可能缺失的字段
                     for k, v in self.default_config.items():
                         if k not in data:
-                            # 旧版本叫 'hotkey'，迁移到 'time_hotkey'
-                            if k == 'time_hotkey' and 'hotkey' in data:
-                                data['time_hotkey'] = data['hotkey']
-                            else:
-                                data[k] = v
+                            data[k] = v
                     return data
             except:
                 return self.default_config
@@ -81,17 +84,24 @@ class ConfigManager:
 
 class TimestampTool:
     def __init__(self):
-        console_log("=== DevTools Pro 启动 ===")
+        console_log("=== DevTools Pro v4.0 启动 ===")
         self.config = ConfigManager()
         
         # 读取配置
         self.time_hotkey = self.config.data.get("time_hotkey", "<ctrl>+<alt>+h")
         self.json_hotkey = self.config.data.get("json_hotkey", "<ctrl>+<alt>+j")
+        self.trace_hotkey = self.config.data.get("trace_hotkey", "<ctrl>+<alt>+k")
         self.current_timezone = self.config.data.get("timezone", "Local")
+        
+        # Trace 配置
+        self.trace_url = self.config.data.get("trace_url", "")
+        self.trace_key = self.config.data.get("trace_key", "traceId")
+        self.time_key = self.config.data.get("time_key", "startTime")
         
         self.root = None
         self.setting_window = None
         self.timezone_window = None
+        self.trace_config_window = None
         
         self.kb_controller = Controller()
         self.listener = None
@@ -107,7 +117,7 @@ class TimestampTool:
         
         threading.Thread(target=self.create_tray_icon, daemon=True).start()
         
-        console_log(f"监听时间: {self.time_hotkey} | 监听JSON: {self.json_hotkey}")
+        console_log(f"监听 Time:{self.time_hotkey} | JSON:{self.json_hotkey} | Trace:{self.trace_hotkey}")
         
         self.main_app.mainloop()
 
@@ -132,10 +142,11 @@ class TimestampTool:
             except: pass
 
         try:
-            # 注册两个快捷键，分别绑定不同的 action 标识
+            # 注册三个快捷键
             hotkey_map = {
                 self.time_hotkey: lambda: self.dispatch_action("time"),
-                self.json_hotkey: lambda: self.dispatch_action("json")
+                self.json_hotkey: lambda: self.dispatch_action("json"),
+                self.trace_hotkey: lambda: self.dispatch_action("trace") # 新增
             }
             self.listener = pynput_kb.GlobalHotKeys(hotkey_map)
             self.listener.start()
@@ -144,10 +155,7 @@ class TimestampTool:
             console_log(f"❌ 监听启动失败: {e}")
 
     def dispatch_action(self, action_type):
-        """快捷键触发的分发中心"""
         console_log(f">>> 触发动作: {action_type}")
-        # 在 pynput 线程中调用，需要通过 after 调度到主线程或直接处理逻辑
-        # 这里为了不阻塞监听线程，直接执行复制逻辑（复制逻辑耗时短），UI 放到主线程
         self.perform_copy_and_process(action_type)
 
     def perform_copy_and_process(self, action_type):
@@ -160,6 +168,7 @@ class TimestampTool:
             self.kb_controller.release(Key.alt_l)
             self.kb_controller.release(Key.alt_r)
             self.kb_controller.release(Key.shift)
+            self.kb_controller.release(Key.ctrl) # 有些组合键可能需要释放Ctrl
             time.sleep(0.1)
             
             # 3. 模拟 Ctrl+C
@@ -177,18 +186,63 @@ class TimestampTool:
                 console_log("剪切板为空")
                 return 
 
-            # 5. 根据类型分发处理
+            # 5. 分发处理
             if action_type == "time":
                 result, success = self.process_timestamp(content)
                 self.main_app.after(0, lambda: self.show_time_ui(result, success))
             elif action_type == "json":
                 result, success = self.process_json(content)
                 self.main_app.after(0, lambda: self.show_json_ui(result, success))
+            elif action_type == "trace":
+                # Trace 逻辑直接在后台打开浏览器，不需要弹窗显示结果，
+                # 但如果打开失败或者配置没填，可以弹窗提示
+                self.process_trace(content)
             
         except Exception as e:
             console_log(f"❌ 处理错误: {e}")
 
-    # --- 逻辑：时间戳处理 ---
+    # --- 逻辑：Trace 跳转 (新增) ---
+    def process_trace(self, text):
+        text = text.strip()
+        if not self.trace_url:
+            self.main_app.after(0, lambda: self.show_time_ui("未配置 Trace URL", False))
+            return
+
+        try:
+            # 1. 准备基础 URL
+            url_parts = list(urlparse(self.trace_url))
+            query = parse_qs(url_parts[4])
+
+            # 2. 添加 TraceId 参数
+            # 清理一下 text，防止带入空格或换行
+            clean_trace_id = re.sub(r'\s+', '', text)
+            query[self.trace_key] = clean_trace_id
+
+            # 3. 添加时间参数 (当前时间 - 15分钟)
+            if self.time_key:
+                now_ts = time.time()
+                start_ts_sec = now_ts - (15 * 60) # 15分钟前
+                
+                # 默认使用毫秒级时间戳 (大多数监控系统标准)
+                # 如果你的系统用秒，可以去掉 * 1000
+                start_ts_ms = int(start_ts_sec * 1000)
+                
+                query[self.time_key] = start_ts_ms
+
+            # 4. 重新构建 URL
+            url_parts[4] = urlencode(query, doseq=True)
+            final_url = urlunparse(url_parts)
+            
+            console_log(f"打开网页: {final_url}")
+            
+            # 5. 调用系统默认浏览器打开
+            webbrowser.open(final_url)
+            
+        except Exception as e:
+            console_log(f"Trace 跳转失败: {e}")
+            self.main_app.after(0, lambda: self.show_time_ui("链接生成失败", False))
+
+    # --- 逻辑：时间戳 ---
     def process_timestamp(self, text):
         match = re.search(r'(\d{10,13}(?:\.\d+)?)', text)
         if match:
@@ -216,13 +270,11 @@ class TimestampTool:
         except:
             return f"非时间戳: {text[:15]}...", False
 
-    # --- 逻辑：JSON 处理 ---
+    # --- 逻辑：JSON ---
     def process_json(self, text):
         try:
             text = text.strip()
-            # 尝试解析 JSON
             parsed = json.loads(text)
-            # 格式化输出 (indent=4 缩进, ensure_ascii=False 支持中文)
             formatted = json.dumps(parsed, indent=4, ensure_ascii=False)
             return formatted, True
         except json.JSONDecodeError as e:
@@ -230,101 +282,15 @@ class TimestampTool:
         except Exception as e:
             return f"未知错误:\n{e}", False
 
-    # --- UI: 时间戳小弹窗 ---
-    def show_time_ui(self, result_text, is_success):
-        # 时间戳窗口：保持“阅后即焚”，点击外部自动关闭
-        self._create_popup_window(260, 80, auto_close=True)
-        
-        frame = ctk.CTkFrame(self.root, fg_color=("gray95", "gray15"), corner_radius=10)
-        frame.pack(fill="both", expand=True, padx=1, pady=1)
-        
-        color = ("#1a1a1a", "#ffffff") if is_success else "#D03030"
-        
-        lbl = ctk.CTkLabel(frame, text=result_text, font=("Consolas", 15, "bold"), text_color=color)
-        lbl.pack(pady=(12, 0))
-
-        tz_display = "Local" if self.current_timezone == "Local" else self.current_timezone
-        ctk.CTkLabel(frame, text=f"({tz_display}) 按 Enter 复制", font=("Microsoft YaHei UI", 10), text_color="gray").pack()
-        
-        # 绑定事件
-        self.root.bind("<Return>", lambda e: self.copy_and_close(result_text))
-
-    # --- UI: JSON 大弹窗 ---
-    def show_json_ui(self, result_text, is_success):
-        # JSON 窗口：关闭“自动关闭”，允许用户操作
-        self._create_popup_window(500, 400, auto_close=False)
-        
-        frame = ctk.CTkFrame(self.root, fg_color=("gray95", "gray15"), corner_radius=10)
-        frame.pack(fill="both", expand=True, padx=1, pady=1)
-
-        # 标题栏
-        title_frame = ctk.CTkFrame(frame, fg_color="transparent", height=30)
-        title_frame.pack(fill="x", padx=10, pady=(5,0))
-        
-        title_text = "JSON 格式化成功" if is_success else "格式化失败"
-        title_color = "#107C10" if is_success else "#D03030"
-        ctk.CTkLabel(title_frame, text=title_text, font=("Microsoft YaHei UI", 12, "bold"), text_color=title_color).pack(side="left")
-        
-        ctk.CTkLabel(title_frame, text="按 Esc 关闭", font=("Microsoft YaHei UI", 10), text_color="gray").pack(side="right")
-
-        # 文本区域
-        textbox = ctk.CTkTextbox(
-            frame, 
-            width=480, 
-            height=300, 
-            font=("Consolas", 11),
-            activate_scrollbars=True
-        )
-        textbox.pack(fill="both", expand=True, padx=10, pady=5)
-        
-        # 插入文本
-        textbox.insert("0.0", result_text)
-        
-        # --- 关键修改：关于文本框状态 ---
-        # 如果设为 "disabled"，用户将无法选中文本进行部分复制。
-        # 如果设为 "normal"，用户可以编辑。
-        # 为了让用户能选中复制，我们必须设为 "normal"。
-        # 虽然用户可以修改里面的字，但这只是个查看器，修改了也不影响原数据，所以是可以接受的。
-        textbox.configure(state="normal") 
-
-        # 底部按钮
-        btn_frame = ctk.CTkFrame(frame, fg_color="transparent")
-        btn_frame.pack(fill="x", padx=10, pady=(0, 10))
-        
-        if is_success:
-            # 复制全部并关闭
-            ctk.CTkButton(
-                btn_frame, 
-                text="复制全部并关闭 (Enter)", 
-                height=28,
-                command=lambda: self.copy_and_close(result_text)
-            ).pack(fill="x")
-            
-            # 绑定回车键复制全部
-            self.root.bind("<Return>", lambda e: self.copy_and_close(result_text))
-        else:
-            ctk.CTkButton(
-                btn_frame, 
-                text="关闭", 
-                height=28, 
-                fg_color="#D03030", hover_color="#B02020",
-                command=lambda: self.root.destroy()
-            ).pack(fill="x")
-
+    # --- UI: 弹窗方法 ---
     def _create_popup_window(self, w, h, auto_close=True):
-        """
-        通用的窗口创建逻辑
-        :param w: 宽度
-        :param h: 高度
-        :param auto_close: 是否开启失去焦点自动关闭 (时间戳True, JSON False)
-        """
         if self.root:
             try: self.root.destroy()
             except: pass
 
         self.root = ctk.CTkToplevel(self.main_app)
-        self.root.overrideredirect(True) # 无边框
-        self.root.attributes('-topmost', True) # 置顶
+        self.root.overrideredirect(True)
+        self.root.attributes('-topmost', True)
         
         try:
             mouse_x = self.root.winfo_pointerx()
@@ -338,27 +304,54 @@ class TimestampTool:
         final_x = mouse_x + 15
         final_y = mouse_y + 15
         
-        # 边界检测
         if final_x + w > screen_w: final_x = mouse_x - w - 10
         if final_y + h > screen_h: final_y = mouse_y - h - 10
         if final_y < 0: final_y = 10
         
         self.root.geometry(f'{w}x{h}+{final_x}+{final_y}')
         
-        # --- 关键修改：区分由于关闭逻辑 ---
         if auto_close:
-            # 只有时间戳窗口才启用“失去焦点自动关闭”
-            # 延时绑定是为了防止窗口刚弹出还没获取焦点就触发关闭
             self.root.after(400, lambda: self.root.bind("<FocusOut>", lambda e: self.root.destroy()))
-        else:
-            # JSON 窗口不绑定 FocusOut，这样你就可以在里面随便点击、选字了
-            pass
-
-        # 无论哪种窗口，ESC 键都能关闭
-        self.root.bind("<Escape>", lambda e: self.root.destroy())
         
+        self.root.bind("<Escape>", lambda e: self.root.destroy())
         self.root.after(50, self.root.focus_force)
         self.root.after(50, self.root.lift)
+
+    def show_time_ui(self, result_text, is_success):
+        self._create_popup_window(260, 80, auto_close=True)
+        frame = ctk.CTkFrame(self.root, fg_color=("gray95", "gray15"), corner_radius=10)
+        frame.pack(fill="both", expand=True, padx=1, pady=1)
+        color = ("#1a1a1a", "#ffffff") if is_success else "#D03030"
+        lbl = ctk.CTkLabel(frame, text=result_text, font=("Consolas", 15, "bold"), text_color=color)
+        lbl.pack(pady=(12, 0))
+        tz_display = "Local" if self.current_timezone == "Local" else self.current_timezone
+        ctk.CTkLabel(frame, text=f"({tz_display}) 按 Enter 复制", font=("Microsoft YaHei UI", 10), text_color="gray").pack()
+        self.root.bind("<Return>", lambda e: self.copy_and_close(result_text))
+
+    def show_json_ui(self, result_text, is_success):
+        self._create_popup_window(500, 400, auto_close=False)
+        frame = ctk.CTkFrame(self.root, fg_color=("gray95", "gray15"), corner_radius=10)
+        frame.pack(fill="both", expand=True, padx=1, pady=1)
+
+        title_frame = ctk.CTkFrame(frame, fg_color="transparent", height=30)
+        title_frame.pack(fill="x", padx=10, pady=(5,0))
+        title_text = "JSON 格式化成功" if is_success else "格式化失败"
+        title_color = "#107C10" if is_success else "#D03030"
+        ctk.CTkLabel(title_frame, text=title_text, font=("Microsoft YaHei UI", 12, "bold"), text_color=title_color).pack(side="left")
+        ctk.CTkLabel(title_frame, text="按 Esc 关闭", font=("Microsoft YaHei UI", 10), text_color="gray").pack(side="right")
+
+        textbox = ctk.CTkTextbox(frame, width=480, height=300, font=("Consolas", 11), activate_scrollbars=True)
+        textbox.pack(fill="both", expand=True, padx=10, pady=5)
+        textbox.insert("0.0", result_text)
+        textbox.configure(state="normal") 
+
+        btn_frame = ctk.CTkFrame(frame, fg_color="transparent")
+        btn_frame.pack(fill="x", padx=10, pady=(0, 10))
+        if is_success:
+            ctk.CTkButton(btn_frame, text="复制全部并关闭 (Enter)", height=28, command=lambda: self.copy_and_close(result_text)).pack(fill="x")
+            self.root.bind("<Return>", lambda e: self.copy_and_close(result_text))
+        else:
+            ctk.CTkButton(btn_frame, text="关闭", height=28, fg_color="#D03030", hover_color="#B02020", command=lambda: self.root.destroy()).pack(fill="x")
 
     def copy_and_close(self, text):
         pyperclip.copy(text)
@@ -373,22 +366,24 @@ class TimestampTool:
         image = Image.new('RGB', (width, height), "#0078D4")
         d = ImageDraw.Draw(image)
         d.rectangle((16, 16, 48, 48), fill="white")
-        d.text((22, 20), "T", fill="#0078D4") # 简单画个T
+        d.text((22, 20), "T", fill="#0078D4")
         
         menu = pystray.Menu(
             pystray.MenuItem("修改时区 (Timezone)", self.open_timezone_safe),
-            pystray.MenuItem("设置快捷键 (Settings)", self.open_settings_safe),
+            pystray.MenuItem("配置 Trace 链接 (New)", self.open_trace_config_safe), # 新增
+            pystray.MenuItem("设置快捷键", self.open_settings_safe),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem("退出 (Exit)", self.quit_app)
+            pystray.MenuItem("退出", self.quit_app)
         )
         self.icon = pystray.Icon("DevTool", image, "开发助手", menu)
         self.icon.run()
 
     def open_settings_safe(self, icon=None, item=None):
         self.main_app.after(0, self.show_settings_ui)
-
     def open_timezone_safe(self, icon=None, item=None):
         self.main_app.after(0, self.show_timezone_ui)
+    def open_trace_config_safe(self, icon=None, item=None):
+        self.main_app.after(0, self.show_trace_config_ui)
 
     def quit_app(self, icon=None, item=None):
         self.icon.stop()
@@ -396,18 +391,18 @@ class TimestampTool:
         self.main_app.quit()
         os._exit(0)
 
-    # --- 设置界面 (升级版：支持两个快捷键) ---
+    # --- 界面：设置快捷键 ---
     def show_settings_ui(self):
         if self.setting_window and self.setting_window.winfo_exists():
             self.setting_window.focus(); return
 
         self.setting_window = ctk.CTkToplevel(self.main_app)
         self.setting_window.title("设置快捷键")
-        self.setting_window.geometry("340x260")
+        self.setting_window.geometry("340x300")
         
         ws = self.setting_window.winfo_screenwidth()
         hs = self.setting_window.winfo_screenheight()
-        self.setting_window.geometry(f'+{int(ws/2-170)}+{int(hs/2-130)}')
+        self.setting_window.geometry(f'+{int(ws/2-170)}+{int(hs/2-150)}')
         self.setting_window.attributes('-topmost', True)
 
         frame = ctk.CTkFrame(self.setting_window)
@@ -415,39 +410,101 @@ class TimestampTool:
 
         ctk.CTkLabel(frame, text="快捷键配置 (pynput格式)", font=("Microsoft YaHei UI", 12, "bold")).pack(pady=5)
         
-        # 时间戳设置
+        # 时间戳
         ctk.CTkLabel(frame, text="时间戳转换:", anchor="w").pack(fill="x", pady=(5,0))
         entry_time = ctk.CTkEntry(frame)
         entry_time.insert(0, self.time_hotkey)
         entry_time.pack(fill="x", pady=2)
 
-        # JSON设置
+        # JSON
         ctk.CTkLabel(frame, text="JSON 格式化:", anchor="w").pack(fill="x", pady=(5,0))
         entry_json = ctk.CTkEntry(frame)
         entry_json.insert(0, self.json_hotkey)
         entry_json.pack(fill="x", pady=2)
 
+        # Trace
+        ctk.CTkLabel(frame, text="Trace 跳转:", anchor="w").pack(fill="x", pady=(5,0))
+        entry_trace = ctk.CTkEntry(frame)
+        entry_trace.insert(0, self.trace_hotkey)
+        entry_trace.pack(fill="x", pady=2)
+
         def save_config():
             t_key = entry_time.get().strip().lower()
             j_key = entry_json.get().strip().lower()
+            k_key = entry_trace.get().strip().lower()
             
-            if t_key and j_key:
+            if t_key and j_key and k_key:
                 try:
                     self.time_hotkey = t_key
                     self.json_hotkey = j_key
+                    self.trace_hotkey = k_key
                     
                     self.config.save_config("time_hotkey", t_key)
                     self.config.save_config("json_hotkey", j_key)
+                    self.config.save_config("trace_hotkey", k_key)
                     
                     self.start_listener()
                     self.setting_window.destroy()
-                except:
-                    console_log("设置保存失败")
+                except: pass
             
         ctk.CTkButton(frame, text="保存生效", command=save_config).pack(pady=20)
 
-    # --- 时区设置界面 (保持不变) ---
+    # --- 界面：Trace 链接配置 (新增) ---
+    def show_trace_config_ui(self):
+        if self.trace_config_window and self.trace_config_window.winfo_exists():
+            self.trace_config_window.focus(); return
+
+        self.trace_config_window = ctk.CTkToplevel(self.main_app)
+        self.trace_config_window.title("配置 Trace 链接")
+        self.trace_config_window.geometry("400x350")
+        
+        ws = self.trace_config_window.winfo_screenwidth()
+        hs = self.trace_config_window.winfo_screenheight()
+        self.trace_config_window.geometry(f'+{int(ws/2-200)}+{int(hs/2-175)}')
+        self.trace_config_window.attributes('-topmost', True)
+
+        frame = ctk.CTkFrame(self.trace_config_window)
+        frame.pack(fill="both", expand=True, padx=20, pady=20)
+
+        ctk.CTkLabel(frame, text="Trace 网页跳转配置", font=("Microsoft YaHei UI", 12, "bold")).pack(pady=5)
+        
+        # URL
+        ctk.CTkLabel(frame, text="基础 URL (不带参数):", anchor="w").pack(fill="x")
+        entry_url = ctk.CTkEntry(frame, placeholder_text="https://...")
+        entry_url.insert(0, self.trace_url)
+        entry_url.pack(fill="x", pady=(0, 10))
+
+        # Trace Key
+        ctk.CTkLabel(frame, text="TraceId 参数名:", anchor="w").pack(fill="x")
+        entry_trace_key = ctk.CTkEntry(frame, placeholder_text="例如: traceId 或 q")
+        entry_trace_key.insert(0, self.trace_key)
+        entry_trace_key.pack(fill="x", pady=(0, 10))
+
+        # Time Key
+        ctk.CTkLabel(frame, text="开始时间 参数名 (默认填入-15min):", anchor="w").pack(fill="x")
+        entry_time_key = ctk.CTkEntry(frame, placeholder_text="例如: startTime (留空则不传)")
+        entry_time_key.insert(0, self.time_key)
+        entry_time_key.pack(fill="x", pady=(0, 10))
+
+        ctk.CTkLabel(frame, text="* 注: 时间参数将自动生成毫秒级时间戳", font=("Microsoft YaHei UI", 10), text_color="gray").pack()
+
+        def save_trace_config():
+            self.trace_url = entry_url.get().strip()
+            self.trace_key = entry_trace_key.get().strip()
+            self.time_key = entry_time_key.get().strip()
+            
+            self.config.save_config("trace_url", self.trace_url)
+            self.config.save_config("trace_key", self.trace_key)
+            self.config.save_config("time_key", self.time_key)
+            
+            self.trace_config_window.destroy()
+            
+        ctk.CTkButton(frame, text="保存配置", command=save_trace_config).pack(pady=20)
+
+    # --- 界面：时区 (不变) ---
     def show_timezone_ui(self):
+        # ... (和之前版本一致，省略未改动代码以节省篇幅，请保留原有时区代码) ...
+        # 如果你直接复制，这里需要补全 show_timezone_ui 的代码
         if self.timezone_window and self.timezone_window.winfo_exists():
             self.timezone_window.focus(); return
 
